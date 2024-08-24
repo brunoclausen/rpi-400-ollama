@@ -3,59 +3,126 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
+# Check if a domain was provided
+if [ -z "$1" ]; then
+    echo "❌ No domain provided. Usage: ./setup_ai_server.sh <your_local_domain_or_ip>"
+    exit 1
+fi
+
+DOMAIN=$1
+
+# Validate domain name format (local domains or IP)
+if ! [[ $DOMAIN =~ ^[a-zA-Z0-9.-]+$ ]]; then
+    echo "❌ Invalid domain name provided: $DOMAIN"
+    exit 1
+fi
+
 # Function to check if a command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Update and upgrade system packages
+# Function to check and install a package if it's not installed
+check_and_install_package() {
+    local package=$1
+    if dpkg -l | grep -qw "$package"; then
+        echo "✅ $package is already installed."
+    else
+        echo "⚙️ $package is not installed. Installing $package..."
+        sudo apt-get install -y -qq "$package" || {
+            echo "❌ Failed to install $package. Exiting."
+            exit 1
+        }
+        echo "✅ $package installed successfully."
+    fi
+}
+
+# Update and upgrade system packages securely
 echo "🔄 Updating system packages... Please wait."
-sudo apt-get update -qq && sudo apt-get upgrade -y -qq
+sudo apt-get update -qq && sudo apt-get upgrade -y -qq || {
+    echo "❌ Failed to update system packages. Please check your network connection and try again."
+    exit 1
+}
 echo "✅ System packages updated."
 
-# Check and install Docker
+# Install necessary firmware updates
+echo "🔧 Updating firmware..."
+sudo rpi-update -y || {
+    echo "❌ Failed to update firmware. Exiting."
+    exit 1
+}
+
+# Check if Docker is running
+echo "🔍 Checking if Docker is running..."
+if systemctl is-active --quiet docker; then
+    echo "✅ Docker is running."
+else
+    echo "⚠️ Docker is not running. Attempting to start Docker..."
+    sudo systemctl start docker || {
+        echo "❌ Failed to start Docker. Exiting."
+        exit 1
+    }
+    echo "✅ Docker started successfully."
+fi
+
+# Check and install required packages
+required_packages=(apt-transport-https ca-certificates curl software-properties-common python3 python3-pip git nginx python3-certbot-nginx)
+for package in "${required_packages[@]}"; do
+    check_and_install_package "$package"
+done
+
+# Install Docker if not already installed
 if command_exists docker; then
     echo "🐳 Docker is already installed."
 else
-    echo "⚙️ Docker is not installed. Installing Docker now..."
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sudo sh get-docker.sh
+    echo "⚙️ Docker is not installed. Installing Docker from official repositories..."
+    curl -sSL https://get.docker.com | sudo sh || {
+        echo "❌ Failed to install Docker. Exiting."
+        exit 1
+    }
     sudo usermod -aG docker $USER
-    echo "✅ Docker installed successfully."
-    echo "Please log out and log back in to apply Docker group changes."
-    exit 0
+    echo "✅ Docker installed successfully. Please log out and log back in or reboot to apply Docker group changes."
 fi
 
-# Check and install Docker Compose
+# Install Docker Compose if not already installed
 if command_exists docker-compose; then
     echo "🔗 Docker Compose is already installed."
 else
-    echo "⚙️ Docker Compose is not installed. Installing Docker Compose now..."
-    sudo apt-get install -y -qq python3-pip
-    sudo pip3 install docker-compose
+    echo "⚙️ Docker Compose is not installed. Installing Docker Compose securely..."
+    sudo pip3 install docker-compose || {
+        echo "❌ Failed to install Docker Compose. Exiting."
+        exit 1
+    }
     echo "✅ Docker Compose installed successfully."
 fi
 
-# Check and install Git
-if command_exists git; then
-    echo "📂 Git is already installed."
+# Install AI frameworks (TensorFlow Lite and PyTorch) if not already installed
+echo "🐍 Checking and installing AI frameworks..."
+pip_installed_packages=$(sudo pip3 list --format=columns)
+if [[ $pip_installed_packages == *"tflite-runtime"* ]]; then
+    echo "✅ TensorFlow Lite is already installed."
 else
-    echo "⚙️ Git is not installed. Installing Git now..."
-    sudo apt-get install -y -qq git
-    echo "✅ Git installed successfully."
+    echo "⚙️ TensorFlow Lite is not installed. Installing TensorFlow Lite..."
+    sudo pip3 install tflite-runtime || {
+        echo "❌ Failed to install TensorFlow Lite. Exiting."
+        exit 1
+    }
+    echo "✅ TensorFlow Lite installed successfully."
 fi
 
-# Check and install Python
-if command_exists python3; then
-    echo "🐍 Python is already installed."
+if [[ $pip_installed_packages == *"torch"* ]]; then
+    echo "✅ PyTorch is already installed."
 else
-    echo "⚙️ Python is not installed. Installing Python now..."
-    sudo apt-get install -y -qq python3 python3-pip
-    echo "✅ Python installed successfully."
+    echo "⚙️ PyTorch is not installed. Installing PyTorch..."
+    sudo pip3 install torch torchvision || {
+        echo "❌ Failed to install PyTorch. Exiting."
+        exit 1
+    }
+    echo "✅ PyTorch installed successfully."
 fi
 
 # Variables
-PROJECT_DIR="gpt2-webui"
+PROJECT_DIR="$HOME/ai-server"
 DOCKERFILE_PATH="$PROJECT_DIR/Dockerfile"
 DOCKER_COMPOSE_PATH="$PROJECT_DIR/docker-compose.yml"
 APP_DIR="$PROJECT_DIR/app"
@@ -63,35 +130,26 @@ PYTHON_APP_FILE="$APP_DIR/app.py"
 
 # Create project directory
 echo "📁 Creating project directory at $PROJECT_DIR..."
-mkdir -p "$PROJECT_DIR"
+sudo mkdir -p "$APP_DIR" || {
+    echo "❌ Failed to create project directory. Exiting."
+    exit 1
+}
 
-# Create application directory
-echo "📁 Creating application directory at $APP_DIR..."
-mkdir -p "$APP_DIR"
-
-# Set up a simple Python web application using Flask and GPT-2
-echo "🚀 Setting up the sample Python application..."
-cat > "$PYTHON_APP_FILE" <<EOL
+# Set up a simple Python web application using Flask and TensorFlow Lite
+echo "🚀 Setting up the AI Python application..."
+sudo cat > "$PYTHON_APP_FILE" <<EOL
 from flask import Flask, request, jsonify
-from transformers import pipeline, set_seed
+import tensorflow as tf
+import torch
+import torchvision.transforms as transforms
+from PIL import Image
+import io
 
 app = Flask(__name__)
 
-# Load the GPT-2 model
-generator = pipeline('text-generation', model='gpt2')
-set_seed(42)
-
-@app.route("/generate", methods=["POST"])
-def generate_text():
-    data = request.json
-    prompt = data.get("prompt", "")
-    max_length = data.get("max_length", 50)
-    results = generator(prompt, max_length=max_length, num_return_sequences=1)
-    return jsonify(results)
-
 @app.route("/", methods=["GET"])
 def index():
-    return "Welcome to the GPT-2 WebUI!"
+    return "Welcome to the AI Server on Raspberry Pi 4!"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
@@ -99,12 +157,12 @@ EOL
 
 # Create Dockerfile
 echo "📝 Creating Dockerfile at $DOCKERFILE_PATH..."
-cat > "$DOCKERFILE_PATH" <<EOL
+sudo cat > "$DOCKERFILE_PATH" <<EOL
 # Use a lightweight Python image that supports ARM architecture
 FROM python:3.9-slim
 
 # Install required packages
-RUN pip install flask transformers
+RUN pip install flask tflite-runtime torch torchvision
 
 # Set the working directory
 WORKDIR /app
@@ -121,13 +179,13 @@ EOL
 
 # Create docker-compose.yml
 echo "📝 Creating docker-compose.yml at $DOCKER_COMPOSE_PATH..."
-cat > "$DOCKER_COMPOSE_PATH" <<EOL
+sudo cat > "$DOCKER_COMPOSE_PATH" <<EOL
 version: '3.8'
 
 services:
-  gpt2-webui:
+  ai-server:
     build: .
-    container_name: gpt2-webui
+    container_name: ai-server
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -135,9 +193,85 @@ services:
       - ./app:/app
 EOL
 
+# Build and run the AI server
+echo "🚀 Building and starting the AI server..."
+cd "$PROJECT_DIR"
+sudo docker-compose up -d || {
+    echo "❌ Failed to build and start the AI server container. Exiting."
+    exit 1
+}
+
+# Check if the AI server container is running
+echo "🔍 Checking if the AI server container is running..."
+if [ "$(sudo docker inspect -f '{{.State.Running}}' ai-server)" = "true" ]; then
+    echo "✅ AI server container is running."
+else
+    echo "❌ AI server container failed to start. Checking logs..."
+    sudo docker logs ai-server
+    exit 1
+fi
+
+# Configure Nginx for local domain (no SSL)
+echo "🔐 Setting up Nginx for local domain..."
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo cat > /etc/nginx/sites-available/ai-server <<EOL
+server {
+    listen 80;
+    server_name $DOMAIN;
+
+    location / {
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOL
+
+sudo ln -s /etc/nginx/sites-available/ai-server /etc/nginx/sites-enabled/
+
+# Restart Nginx to apply changes
+echo "🔄 Restarting Nginx..."
+sudo systemctl restart nginx || {
+    echo "❌ Failed to restart Nginx. Exiting."
+    exit 1
+}
+
+# Check if Nginx is running
+echo "🔍 Checking if Nginx is running..."
+if systemctl is-active --quiet nginx; then
+    echo "✅ Nginx is running."
+else
+    echo "❌ Nginx failed to start. Checking Nginx status..."
+    sudo systemctl status nginx
+    exit 1
+fi
+
+# Create systemd service for AI server
+echo "🔧 Creating systemd service for AI server..."
+sudo cat > /etc/systemd/system/ai-server.service <<EOL
+[Unit]
+Description=AI Server
+After=docker.service
+Requires=docker.service
+
+[Service]
+Restart=always
+ExecStart=/usr/local/bin/docker-compose -f $DOCKER_COMPOSE_PATH up
+ExecStop=/usr/local/bin/docker-compose -f $DOCKER_COMPOSE_PATH down
+WorkingDirectory=$PROJECT_DIR
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+# Enable and start AI server service
+sudo systemctl daemon-reload
+sudo systemctl enable ai-server
+sudo systemctl start ai-server
+
 # Summary
-echo "🎉 Setup complete!"
-echo "To start the services, navigate to the project directory and run the following commands:"
-echo "  cd $PROJECT_DIR"
-echo "  docker-compose up -d"
-echo "After running these commands, your GPT-2 web interface will be accessible at http://localhost:8080"
+echo "🎉 AI Server setup complete!"
+echo "Access your AI server at: http://$DOMAIN"
